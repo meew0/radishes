@@ -75,6 +75,10 @@ def spacey(o)
   (o.nil? || o == '') ? ' ' : o
 end
 
+def deslash(o)
+  o.nil? ? nil : o.gsub('/', '／')
+end
+
 def pq(prompt, default = nil)
   prompt = prompt.sub('%%', spacey(default))
   split = prompt.split(/(?<=\[)|(?=\])/)
@@ -86,13 +90,13 @@ def pq(prompt, default = nil)
 end
 
 def ffprobe_stream_property(file, property, stream_descriptor = 'a:0')
-  safe_run('ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=' + property, '-of', 'default=noprint_wrappers=1:nokey=1', file).strip
+  safe_run('ffprobe', '-v', 'error', '-select_streams', stream_descriptor, '-show_entries', 'stream=' + property, '-of', 'default=noprint_wrappers=1:nokey=1', file, no_stderr: true).strip
 end
 
 def format_str(codec_name, bit_rate, bit_depth, sample_rate)
   case codec_name
   when 'flac'
-    return 'FLAC' if bit_depth == 16
+    return 'FLAC' if bit_depth == '16'
     sr_short = (sample_rate.to_i / 1000.0).to_s
     sr_short = sr_short[0..-3] if sr_short.end_with?('.0')
     "FLAC #{bit_depth}-#{sr_short}"
@@ -459,7 +463,17 @@ def read_source(source, aso)
   [is_dir, audio_files, source_dir, all_tags]
 end
 
+TARGET_COMPONENT_MAPPING = [
+  [:library_path, 37],
+  [:shelf_folder, 94],
+  [:aa_path, 95],
+  [:new_folder_name, 96],
+  [:basename, 97],
+]
+
 ARGV.each do |source|
+  source = File.absolute_path(source)
+
   hr2 80
   unless File.exist?(source)
     cl 31, 'File/folder does not exist: ', source
@@ -480,7 +494,7 @@ ARGV.each do |source|
   if config['run_beets']
     input = pq 'Running beets; [n] to skip, [f] to enter CLI flags: '
     if input != 'n'
-      beet_cmd = config['beet_command']
+      beet_cmd = config['beet_command'].clone
       if input == 'f'
         print 'Enter flags: '
         beet_cmd += query.split(' ')
@@ -491,6 +505,7 @@ ARGV.each do |source|
 
       beet_cmd << source
       hr 80
+      cl 90, (['$'] + beet_cmd).join(' ')
       system *beet_cmd
       hr 80
     end
@@ -607,17 +622,9 @@ ARGV.each do |source|
     puts
 
     target_components[:library_path] = config['library_path']
-    target_components[:aa_path] = album_artist if aa_group && !album_artist.nil?
-    target_components[:new_folder_name] = new_folder_name unless album.nil?
+    target_components[:aa_path] = deslash(album_artist) if aa_group && !album_artist.nil?
+    target_components[:new_folder_name] = deslash(new_folder_name) unless album.nil?
     target_components[:basename] = File.basename(source) unless is_dir
-
-    TARGET_COMPONENT_MAPPING = [
-      [:library_path, 37],
-      [:shelf_folder, 94],
-      [:aa_path, 95],
-      [:new_folder_name, 96],
-      [:basename, 97],
-    ]
 
     target = nil
     has_basename = false
@@ -751,7 +758,7 @@ ARGV.each do |source|
       puts
     end
 
-    cover_source = nil
+    cover_source, cover_ext = nil, nil
     if is_dir
       image_files = Dir.glob('**/*.{jpg,png,jpeg,JPG,PNG,JPEG}', base: source)
       definitive_covers = image_files.select do |e|
@@ -779,7 +786,7 @@ ARGV.each do |source|
           else
             cover_source = config['cover_file']
             begin
-              data = open(url).read
+              data = URI.open(command.strip).read
               File.write(cover_source, data)
             rescue => e
               cl 31, 'Error while processing remote image: ', e.to_s
@@ -792,10 +799,16 @@ ARGV.each do |source|
 
         unless cover_source.nil?
           codec_name = ffprobe_stream_property(cover_source, 'codec_name', 'v:0')
-          unless ['mjpeg', 'png'].include?(codec_name)
+          case codec_name
+          when 'mjpeg'
+            cover_ext = '.jpg'
+          when 'png'
+            cover_ext = '.png'
+          else
             cl 34, 'Converting ', codec_name, ' image to png.'
             safe_run('ffmpeg', '-i', cover_source, config['cover_converted_file'])
             cover_source = config['cover_converted_file']
+            cover_ext = '.png'
           end
         end
       end
@@ -821,7 +834,12 @@ ARGV.each do |source|
       path = File.join(target_dir, file)
       new_tags = tags.clone
 
-      new_tags.delete(:artist)
+      if config['artist_remap'].key?(tags[:artist])
+        new_tags[:artist] = config['artist_remap'][tags[:artist]]
+      else
+        new_tags.delete(:artist)
+      end
+
       new_tags[:album] = unify_target if unify_albums
       new_tags[:album_artist] = album_artist
       new_tags[:album_sort] = album_sort
@@ -837,7 +855,7 @@ ARGV.each do |source|
     end
 
     unless cover_source.nil?
-      cover_ext = File.extname(cover_source)
+      cover_ext = File.extname(cover_source) if cover_ext.nil?
       (all_tags.map { |k, v| File.dirname(k) } + ['.']).uniq.each do |tfwmf|
         new_cover_path = File.join(target_dir, tfwmf, 'cover' + cover_ext)
         unless File.exist?(new_cover_path)
