@@ -3,7 +3,9 @@ require 'fileutils'
 require 'tomlrb'
 require 'date'
 require 'json'
+require 'uri'
 require 'open-uri'
+require 'http'
 
 # Defines cl, hr2, etc
 load '~/Projects/utils.rb'
@@ -90,7 +92,7 @@ def pq(prompt, default = nil)
 end
 
 def ffprobe_stream_property(file, property, stream_descriptor = 'a:0')
-  safe_run('ffprobe', '-v', 'error', '-select_streams', stream_descriptor, '-show_entries', 'stream=' + property, '-of', 'default=noprint_wrappers=1:nokey=1', file, no_stderr: true).strip
+  safe_run('ffprobe', '-v', 'error', '-pattern_type', 'none', '-select_streams', stream_descriptor, '-show_entries', 'stream=' + property, '-of', 'default=noprint_wrappers=1:nokey=1', file, no_stderr: true).strip
 end
 
 def format_str(codec_name, bit_rate, bit_depth, sample_rate)
@@ -150,6 +152,8 @@ def read_tags_from_xiph(tag)
   tags[:total_tracks] = fields['totaltracks']&.first&.to_i || fields['tracktotal']&.first&.to_i || fields['trackc']&.first&.to_i
   tags[:disc] = fields['discnumber']&.first&.to_i || fields['disc']&.first&.to_i
   tags[:total_discs] = fields['totaldiscs']&.first&.to_i || fields['disctotal']&.first&.to_i || fields['discc']&.first&.to_i
+  tags[:disambiguation] = fields['musicbrainz_albumcomment']&.first
+  tags[:mb_release_id] = fields['musicbrainz_albumid']&.first
   tags
 end
 
@@ -181,6 +185,8 @@ def read_tags(filename, codec_name)
         tags[:artist_sort] = tag.frame_list('TSOP')&.first&.to_s
         tags[:album_sort] = tag.frame_list('TSOA')&.first&.to_s
         tags[:album_artist_sort] = mp3_user_value(tag, 'ALBUMARTISTSORT')
+        tags[:disambiguation] = mp3_user_value(tag, 'MusicBrainz Album Comment')
+        tags[:mb_release_id] = mp3_user_value(tag, 'MusicBrainz Album Id')
         tags[:track], tags[:total_tracks] = mp3_unpack(tag.frame_list('TRCK')&.first&.to_s)
         tags[:disc], tags[:total_discs] = mp3_unpack(tag.frame_list('TPOS')&.first&.to_s)
       elsif file.id3v1_tag?
@@ -217,8 +223,8 @@ def read_tags(filename, codec_name)
 end
 
 def iterate_tags(tags, &block)
-  raise 'total_tracks must be specified' if tags.key?(:track) && !tags.key?(:total_tracks)
-  raise 'total_discs must be specified' if tags.key?(:disc) && !tags.key?(:total_discs)
+  raise 'total_tracks must be specified' if !tags[:track].nil? && !tags.key?(:total_tracks)
+  raise 'total_discs must be specified' if !tags[:disc].nil? && !tags.key?(:total_discs)
   tags.each { |k, v| block.call(k, v) unless v.nil? }
 end
 
@@ -270,6 +276,11 @@ def mp3_t_frame(tag, key, value)
 end
 
 def write_tags(filename, codec_name, tags)
+  unless File.exist?(filename)
+    cl 33, 'Trying to write tags to non-existent file: ', filename
+    return
+  end
+
   case codec_name
   when 'flac'
     TagLib::FLAC::File.open(filename) do |file|
@@ -392,7 +403,7 @@ class ASO
         'R' => []
       }
     elsif @aso[artist]['P'] != sort && !@aso[artist]['R'].include?(sort) && !sort.nil?
-      print 'Found sort order ['.c(36) + sort.c(37) + '] for artist ['.c(36) + artist.c(37) + '], but different sort order ['.c(36) + @aso[artist]['P'].c(37) + '] is already stored. Enter to ignore, ['.c(36) + 'r'.c(37) + '] to replace: '
+      print 'Found sort order ['.c(36) + sort.c(37) + '] for artist ['.c(36) + artist.c(37) + '], but different sort order ['.c(36) + @aso[artist]['P'].c(37) + '] is already stored. Enter to ignore, ['.c(36) + 'r'.c(37) + '] to replace: '.c(36)
       command = query_stdin
       if command == 'r'
         old_p = @aso[artist]['P']
@@ -417,14 +428,18 @@ class ASO
   def query_new(artist)
     return nil if artist.nil?
 
-    print 'Enter sort order for artist ['.c(36) + artist.c(37) + ']: '.c(36)
-    result = query_stdin
-    new_sort = result.empty? ? artist : result
+    new_sort = query_new_actual(artist)
     @aso[artist] = {
       'P' => new_sort,
       'R' => []
     }
     new_sort
+  end
+
+  def query_new_actual(artist)
+    print 'Enter sort order for artist ['.c(36) + artist.c(37) + ']: '.c(36)
+    result = query_stdin
+    result.empty? ? artist : result
   end
 
   def query_stdin
@@ -437,11 +452,57 @@ aso = ASO.new(config['aso_file'])
 mapping_file = config['mapping_file']
 mapping = File.exist?(mapping_file) ? JSON.parse(File.read(mapping_file)) : {}
 
+def save_mapping(mapping_file, mapping)
+  File.write(mapping_file, JSON.pretty_generate(mapping))
+end
+
+def map_artist(config, artist)
+  config['artist_remap'].key?(artist) ? config['artist_remap'][artist] : artist
+end
+
+def resolve_group(config, short)
+  config['group_shorts'].key?(short) ? config['group_shorts'][short] : short
+end
+
+def check_caa(rel_id, thread)
+  if thread.nil?
+    cl 33, 'No MusicBrainz release ID found, or CAA retrieval is disabled.'
+    return nil
+  end
+
+  if thread.alive?
+    cl 34, 'Retrieval thread is still running. Waiting for retrieval to finish...'
+    thread.join
+  end
+
+  result = $cover_art_data[rel_id]
+
+  if result.nil?
+    cl 31, 'Got nil! Something went wrong.'
+    return nil
+  end
+
+  if result == :none
+    cl 33, 'No cover art was found in the CAA...'
+    return nil
+  end
+
+  result
+end
+
 def read_source(source, aso)
   is_dir = File.directory?(source)
 
   if is_dir
-    audio_files = Dir.glob('**/*.{flac,mp3,m4a,ogg}', base: source)
+    audio_files = Dir.glob('**/*.{flac,mp3,m4a,ogg,FLAC,MP3,M4A,OGG}', base: source)
+    if ENV.key?('RADISH_EXCLUDE')
+      regex = Regexp.new(ENV['RADISH_EXCLUDE'])
+      rejected, audio_files = audio_files.partition { |e| e.match?(regex) }
+      cl 35, 'Rejected ', rejected.length, ' files:'
+      rejected.each do |e|
+        cl 35, ' ', e
+      end
+    end
     source_dir = source
   else
     audio_files = [File.basename(source)]
@@ -471,6 +532,93 @@ TARGET_COMPONENT_MAPPING = [
   [:basename, 97],
 ]
 
+def finalise_target(target_components, select_components = nil)
+  final_target_path_components = []
+  target_display = ''
+
+  if select_components.nil?
+    tcm = TARGET_COMPONENT_MAPPING
+  else
+    tcm = TARGET_COMPONENT_MAPPING.select { |k, v| select_components.include?(k) }
+  end
+
+  mapped = tcm.map { |k, v| [target_components[k], v] }.reject { |k, v| k.nil? }
+
+  mapped.each do |k, v|
+    final_target_path_components << k
+    slash = (k == mapped.last.first) ? '' : '/'
+    target_display += (k + slash).c(v)
+  end
+
+  target = File.join(*final_target_path_components)
+
+  [target, target_display]
+end
+
+def mv(mapping_file, mapping, source, target)
+  system 'mv', source, target
+  mapping[source] = target
+  save_mapping(mapping_file, mapping)
+  cl 32, 'Moved ', source, ' to ', target
+end
+
+if ARGV[0] == 'mv'
+  if ARGV.length != 3
+    err 'radish mv requires 2 additional arguments!'
+  end
+
+  mv(mapping_file, mapping, ARGV[1], ARGV[2])
+  exit
+elsif ARGV[0] == 'mv_g' # move into different group, one layer up from source
+  if ARGV.length != 3
+    err 'radish mv_g requires 2 additional arguments!'
+  end
+
+  source = ARGV[1]
+  source_group = File.dirname(source)
+  source_shelf = File.dirname(source_group)
+  target = File.join(source_shelf, ARGV[2], File.basename(ARGV[1]))
+
+  mv(mapping_file, mapping, source, target)
+  exit
+elsif ARGV[0] == 'aso'
+  if ARGV.length != 2
+    err 'radish aso requires 1 additional argument!'
+  end
+
+  new_so = aso.query_new_actual(ARGV[1])
+  aso.ingest_one_manual(ARGV[1], new_so)
+  aso.save
+  exit
+elsif ARGV[0] == 'subsort'
+  if ARGV.length < 2
+    err 'radish subsort requires at least 1 additional argument!'
+  end
+
+  ARGV[1..-1].each do |source|
+    hr2 80
+    cl 34, 'Processing: ', source
+    target_dir = pq 'Enter target folder path: '
+    until !(target_dir || '').empty? && File.exist?(target_dir)
+      print 'Target folder does not yet exist and will be created (or none was specified). Press enter to continue, or enter a different path: '.c(33)
+      result = query
+      if result.empty?
+        FileUtils.mkdir_p target_dir unless (target_dir || '').empty?
+        break
+      end
+      target_dir = result
+    end
+
+    abs_source = File.absolute_path(source)
+    abs_target = File.absolute_path(File.join(target_dir, File.basename(abs_source)))
+    mv(mapping_file, mapping, abs_source, abs_target)
+  end
+
+  exit
+end
+
+fast_forward = false
+
 ARGV.each do |source|
   source = File.absolute_path(source)
 
@@ -482,14 +630,24 @@ ARGV.each do |source|
 
   if mapping.key?(source)
     cl 31, 'File/folder has already been processed: ', source
-    next if config['always_skip_mapped']
-    command = pq 'Enter to skip, [y] to process again: '
+    next if config['always_skip_mapped'] || fast_forward
+    command = pq 'Enter to skip, [y] to process again, [f] to fast-forward: '
+    if command == 'f'
+      fast_forward = true
+      next
+    end
     next unless command == 'y'
   end
 
   cl 34, 'Processing: ', source
 
   is_dir, audio_files, source_dir, all_tags = read_source(source, aso)
+
+  if audio_files.empty?
+    cl 31, 'No audio files found!'
+    print 'Press enter to continue. '.c(31)
+    query
+  end
 
   if config['run_beets']
     input = pq 'Running beets; [n] to skip, [f] to enter CLI flags: '
@@ -527,11 +685,28 @@ ARGV.each do |source|
 
   global_tags = all_tags[audio_files[0]]
 
+  caa_thread = nil
+  $cover_art_data ||= {}
+
+  if config['load_caa'] && !global_tags[:mb_release_id].nil?
+    caa_thread = Thread.new do
+      rel_id = global_tags[:mb_release_id]
+      begin
+        $cover_art_data[rel_id] = URI.open("https://coverartarchive.org/release/#{rel_id}/front")
+      rescue
+        $cover_art_data[rel_id] = :none
+      end
+    end
+  end
+
+  artists = all_tags.values.map { |e| e[:artist] }
+  # puts 'All artists: '.c(35) + artists.uniq.sort.map { |e| e.c(95) }.join(', '.c(35))
+
   ck 90, 'Enter [', 37, '-', 90, '] to leave a field empty.'
   fstr = pq "Audio format [%%]: ", format_str(codec_name, bit_rate, bit_depth, sample_rate)
 
   album = pq "Album [%%]: ", global_tags[:album]
-  album_artist = pq "Album artist [%%]; [v] for various: ", global_tags[:album_artist]
+  album_artist = pq "Album artist [%%]; [v] for various: ", map_artist(config, global_tags[:album_artist])
   album_artist = config['various_artists'] if album_artist == 'v'
 
   release_date = global_tags[:release_date]
@@ -584,6 +759,8 @@ ARGV.each do |source|
   dstr = event.nil? ? "[#{new_release_date}]" : "[#{new_release_date}] [#{event}]"
   aa_component = album_artist == config['various_artists'] ? '' : "#{album_artist} - "
   new_folder_name = "#{dstr} #{aa_component}#{album} [#{fstr}]"
+  new_folder_name_alt = "#{dstr} #{album} [#{fstr}]"
+  new_folder_name_aa_always = "#{dstr} #{album_artist} - #{album} [#{fstr}]"
 
   puts
 
@@ -591,7 +768,7 @@ ARGV.each do |source|
 
   if config['shelves'].nil? || config['shelves'].empty?
     cl 34, 'No shelves found. Copying to main library path.'
-    aa_group = false
+    group_mode = :none
   else
     cl 90, 'Shelves:'
     folder_lookup = {}
@@ -605,12 +782,12 @@ ARGV.each do |source|
       selection = pq 'Select shelf: '
 
       if selection.nil?
-        cl 34, 'No shelf selected. Copying to main library path.'
-        aa_group = false
+        cl 33, 'No shelf selected. Copying to main library path.'
+        group_mode = :none
       elsif folder_lookup.key?(selection)
         shelf = folder_lookup[selection]
         target_components[:shelf_folder] = shelf['folder']
-        aa_group = shelf['aa_group']
+        group_mode = shelf['group'].to_sym
       else
         cl 31, 'Invalid shelf!'
         next
@@ -622,36 +799,56 @@ ARGV.each do |source|
     puts
 
     target_components[:library_path] = config['library_path']
-    target_components[:aa_path] = deslash(album_artist) if aa_group && !album_artist.nil?
     target_components[:new_folder_name] = deslash(new_folder_name) unless album.nil?
     target_components[:basename] = File.basename(source) unless is_dir
+
+    case group_mode
+    when :album_artist
+      aa_group_mapped = config['aa_group_remap'].include?(album_artist) ? config['aa_group_remap'][album_artist] : album_artist
+      target_components[:aa_path] = deslash(aa_group_mapped) unless album_artist.nil?
+    when :query
+      target_components[:aa_path] = resolve_group(config, pq('Enter group folder name [%%]: ', target_components[:aa_path]))
+
+      until File.exist?(finalise_target(target_components, [:library_path, :shelf_folder, :aa_path]).first)
+        print "Group folder '".c(33), target_components[:aa_path].c(93), "' does not yet exist and will be created. Press enter to continue, or enter a different path: ".c(33)
+        result = query
+        break if result.empty?
+        target_components[:aa_path] = resolve_group(config, result)
+      end
+    when :none
+      # ignore
+    else
+      err 'Invalid shelf group mode: ', group_mode
+    end
 
     target = nil
     has_basename = false
 
     loop do
-      final_target_path_components = []
-      target_display = ''
+      target, target_display = finalise_target(target_components)
 
-      mapped = TARGET_COMPONENT_MAPPING.map { |k, v| [target_components[k], v] }.reject { |k, v| k.nil? }
-
-      mapped.each do |k, v|
-        final_target_path_components << k
-        slash = (k == mapped.last.first) ? '' : '/'
-        target_display += (k + slash).c(v)
-      end
-
-      target = File.join(*final_target_path_components)
       puts 'Target: '.c(90) + target_display
       puts '        ' + target.c(90)
 
       cl 33, '(Target already exists! Consider deleting it before proceeding; otherwise there might be problems)' if File.exist?(target)
       cl 33, "Album artist folder is '", config['various_artists'], "'; consider setting a different one." if target_components[:aa_path] == config['various_artists']
-      command = pq 'Press enter to continue; [a] to set album artist folder: '
+
+      if aa_component.empty?
+        command = pq 'Press enter to continue; [a] to set album artist folder, [v] to add album artist to folder name, [d] to disambiguate: '
+      else
+        command = pq 'Press enter to continue; [a] to set album artist folder, [c] to omit album artist from folder name, [d] to disambiguate: '
+      end
 
       case command
       when 'a'
         target_components[:aa_path] = pq 'Enter new album artist folder: '
+      when 'c'
+        target_components[:new_folder_name] = new_folder_name_alt
+      when 'd'
+        result = pq 'Enter album disambiguation tag [%%]: ', global_tags[:disambiguation]
+        target_components[:new_folder_name] = "#{dstr} #{aa_component}#{album} [#{result}] [#{fstr}]"
+      when 'v'
+        target_components[:new_folder_name] = new_folder_name_aa_always
       else
         break
       end
@@ -669,7 +866,7 @@ ARGV.each do |source|
       ask_unify_albums = true
       all_albums = all_tags.map { |k, v| v[:album] }.uniq
       if all_albums.length > 1
-        puts 'Found more than one album in file tags: '.c(33) + all_albums.map { |e| e.c(93) }.join(', '.c(33))
+        puts 'Found more than one album in file tags: '.c(33) + all_albums.compact.map { |e| e.c(93) }.join(', '.c(33))
       elsif all_albums.length == 1 && all_albums.first != album
         cl 33, 'Album in file tags [', all_albums.first, '] does not match queried album [', album, ']'
       else
@@ -704,15 +901,13 @@ ARGV.each do |source|
             cl 34, 'Found track number ', tags[:track], ' from filename ', file
           end
         end
-        unless any_match?
-          cl 33, 'Found no matching filenames...'
-        end
+        cl 33, 'Found no matching filenames...' unless any_match
       end
 
       puts
     end
 
-    track_groups = all_tracks.group_by { |e| e }.values.sort_by(&:first)
+    track_groups = all_tracks.compact.group_by { |e| e }.values.sort_by(&:first)
     if track_groups.any? { |e| e.length > 1 }
       puts 'Found duplicate track numbers! All track numbers: '.c(33) + track_groups.flatten.map { |e| e.to_s.c(93) }.join(', '.c(33))
 
@@ -777,21 +972,48 @@ ARGV.each do |source|
           cl 90, ' [', i.to_s.rjust(l, ' '), "]: #{image_file} (#{size} bytes)"
         end
 
+        caa_data = $cover_art_data[global_tags[:mb_release_id]]
+        cl 32, 'CAA cover art appears to be available!' if !caa_data.nil? && caa_data != :none
+
         loop do
-          command = pq 'Select one of the above, paste a URL, or press enter for no cover art: '
+          command = pq 'Select one of the above, paste a path or URL ([c] to copy metadata), [m] to check the CAA, or press enter for no cover art: '
           if command.nil?
             # Do nothing
-          elsif command.match?(/^\d+$/)
+          elsif command == 'c'
+            str = "#{album_artist} - #{album}"
+            system *(config['clip_command'] + [str])
+            cl 32, "Copied '", str, "' to clipboard!"
+            next
+          elsif command == 'm'
+            caa_data = check_caa(global_tags[:mb_release_id], caa_thread)
+            next if caa_data.nil?
+            cover_source = config['cover_file']
+            File.write(cover_source, caa_data.read)
+          elsif command.match?(/^\d+$/) && command.to_i < image_files.length
             cover_source = File.join(source, image_files[command.to_i])
           else
-            cover_source = config['cover_file']
-            begin
-              data = URI.open(command.strip).read
-              File.write(cover_source, data)
-            rescue => e
-              cl 31, 'Error while processing remote image: ', e.to_s
-              puts e.backtrace
-              next
+            url = command.strip.gsub(/(^')|('$)/, '').gsub("'\\''", "'")
+
+            if url.start_with?('/')
+              cover_source = url
+            else
+              # Try to load remotely
+              cover_source = config['cover_file']
+              begin
+
+                begin
+                  uri = URI.parse(url)
+                rescue URI::InvalidURIError
+                  uri = URI.parse(URI::Parser.new.escape(url))
+                end
+
+                data = URI.open(uri).read
+                File.write(cover_source, data)
+              rescue => e
+                cl 31, 'Error while processing remote image: ', e.to_s
+                puts e.backtrace
+                next
+              end
             end
           end
           break
@@ -806,7 +1028,7 @@ ARGV.each do |source|
             cover_ext = '.png'
           else
             cl 34, 'Converting ', codec_name, ' image to png.'
-            safe_run('ffmpeg', '-i', cover_source, config['cover_converted_file'])
+            safe_run('ffmpeg', '-y', '-i', cover_source, config['cover_converted_file'])
             cover_source = config['cover_converted_file']
             cover_ext = '.png'
           end
@@ -824,11 +1046,13 @@ ARGV.each do |source|
     puts (['$'] + full_copy_command).join(' ').c(90)
     system *full_copy_command
     mapping[source] = target
-    File.write(mapping_file, JSON.pretty_generate(mapping))
+    save_mapping(mapping_file, mapping)
     cl 32, 'Copied!'
 
     max_track = all_tags.values.map { |e| e[:track] }.compact.max
     max_disc = all_tags.values.map { |e| e[:disc] }.compact.max
+
+    extra_album_sorts = {}
 
     all_tags.each do |file, tags|
       path = File.join(target_dir, file)
@@ -842,11 +1066,21 @@ ARGV.each do |source|
 
       new_tags[:album] = unify_target if unify_albums
       new_tags[:album_artist] = album_artist
-      new_tags[:album_sort] = album_sort
       new_tags[:album_artist_sort] = album_artist_sort
-      new_tags[:artist_sort] = aso.query(tags[:artist])
+      new_tags[:artist_sort] = aso.query(new_tags[:artist] || tags[:artist])
       new_tags[:release_date] = new_release_date
       new_tags[:year] = new_year unless new_year.nil?
+
+      if new_tags[:album] == album
+        new_tags[:album_sort] = album_sort
+      else
+        if extra_album_sorts.key?(new_tags[:album])
+          new_tags[:album_sort] = extra_album_sorts[new_tags[:album]]
+        else
+          new_tags[:album_sort] = pq 'Enter additional album sort order [%%]: ', new_tags[:album]
+          extra_album_sorts[new_tags[:album]] = new_tags[:album_sort]
+        end
+      end
 
       new_tags[:total_tracks] = max_track if !new_tags[:track].nil? && new_tags[:total_tracks].nil?
       new_tags[:total_discs] = max_disc if !new_tags[:disc].nil? && new_tags[:total_discs].nil?
