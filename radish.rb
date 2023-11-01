@@ -5,7 +5,7 @@ require 'date'
 require 'json'
 require 'uri'
 require 'open-uri'
-require 'http'
+require 'cgi'
 
 # Defines cl, hr2, etc
 load '~/Projects/utils.rb'
@@ -368,6 +368,8 @@ def write_tags(filename, codec_name, tags)
   end
 end
 
+class ASOSkip < Exception; end
+
 # ASO / artist sort order file
 class ASO
   def initialize(path)
@@ -384,10 +386,13 @@ class ASO
   end
 
   def ingest(tags_set)
-
-    tags_set.each do |tags|
-      ingest_one_manual(tags[:artist], tags[:artist_sort])
-      ingest_one_manual(tags[:album_artist], tags[:album_artist_sort])
+    begin
+      tags_set.each do |tags|
+        ingest_one_manual(tags[:artist], tags[:artist_sort])
+        ingest_one_manual(tags[:album_artist], tags[:album_artist_sort])
+      end
+    rescue ASOSkip
+      cl 33, 'Skipping remaining ASO ingestions.'
     end
   end
 
@@ -397,11 +402,21 @@ class ASO
     if @aso[artist].nil? && (sort.nil? || artist == sort)
       query_new(artist)
     elsif @aso[artist].nil? && artist != sort
-      ck 36, 'Storing sort order [', 37, sort, 36, '] for artist [', 37, artist, 36, ']'
-      @aso[artist] = {
-        'P' => sort,
-        'R' => []
-      }
+      ckn 36, 'Storing sort order [', 37, sort, 36, '] for artist [', 37, artist, 36, '], or enter alternative: '
+      command = query_stdin
+      if command.empty?
+        @aso[artist] = {
+          'P' => sort,
+          'R' => []
+        }
+      elsif command == 's'
+        raise ASOSkip
+      else
+        @aso[artist] = {
+          'P' => command,
+          'R' => [sort]
+        }
+      end
     elsif @aso[artist]['P'] != sort && !@aso[artist]['R'].include?(sort) && !sort.nil?
       print 'Found sort order ['.c(36) + sort.c(37) + '] for artist ['.c(36) + artist.c(37) + '], but different sort order ['.c(36) + @aso[artist]['P'].c(37) + '] is already stored. Enter to ignore, ['.c(36) + 'r'.c(37) + '] to replace: '.c(36)
       command = query_stdin
@@ -409,6 +424,8 @@ class ASO
         old_p = @aso[artist]['P']
         @aso[artist]['R'] << old_p
         @aso[artist]['P'] = sort
+      elsif command == 's'
+        raise ASOSkip
       else
         @aso[artist]['R'] << sort
       end
@@ -439,6 +456,7 @@ class ASO
   def query_new_actual(artist)
     print 'Enter sort order for artist ['.c(36) + artist.c(37) + ']: '.c(36)
     result = query_stdin
+    raise ASOSkip if result == 's'
     result.empty? ? artist : result
   end
 
@@ -462,6 +480,21 @@ end
 
 def resolve_group(config, short)
   config['group_shorts'].key?(short) ? config['group_shorts'][short] : short
+end
+
+def try_load_caa(global_tags)
+  unless global_tags[:mb_release_id].nil?
+    Thread.new do
+      rel_id = global_tags[:mb_release_id]
+      begin
+        $cover_art_data[rel_id] = URI.open("https://coverartarchive.org/release/#{rel_id}/front")
+      rescue
+        $cover_art_data[rel_id] = :none
+      end
+    end
+  else
+    nil
+  end
 end
 
 def check_caa(rel_id, thread)
@@ -494,7 +527,7 @@ def read_source(source, aso)
   is_dir = File.directory?(source)
 
   if is_dir
-    audio_files = Dir.glob('**/*.{flac,mp3,m4a,ogg,FLAC,MP3,M4A,OGG}', base: source)
+    audio_files = Dir.glob('**/*.{flac,mp3,m4a,ogg,FLAC,MP3,M4A,OGG,opus,OPUS}', base: source)
     if ENV.key?('RADISH_EXCLUDE')
       regex = Regexp.new(ENV['RADISH_EXCLUDE'])
       rejected, audio_files = audio_files.partition { |e| e.match?(regex) }
@@ -615,6 +648,130 @@ elsif ARGV[0] == 'subsort'
   end
 
   exit
+elsif ARGV[0] == 'find_unmapped'
+  all = Dir.glob('**/*.{flac,mp3,ogg,m4a,FLAC,MP3,OGG,M4A,opus,OPUS}').map { |e| File.absolute_path(e) }.sort
+  mapped = mapping.keys.sort
+
+  total = 0
+
+  all.each do |e|
+    unless mapped.any? { |m| e.start_with?(m) }
+      total += 1
+      puts "unmapped: #{e}"
+    end
+  end
+
+  puts "total: #{total}"
+  exit
+elsif ARGV[0] == 'aso_fix'
+  all = Dir.glob('**/*.{flac,mp3,ogg,m4a,FLAC,MP3,OGG,M4A,opus,OPUS}', base: config['library_path']).sort
+
+  all.each do |e|
+    # cl 90, 'reading: ' + e
+    full_path = File.join(config['library_path'], e)
+    codec_name = ffprobe_stream_property(full_path, 'codec_name')
+    tags = read_tags(full_path, codec_name)
+
+    new_aso = aso.query(tags[:artist])
+    new_aaso = aso.query(tags[:album_artist])
+
+    new_tags = {}
+
+    if new_aso != tags[:artist_sort]
+      ck 33, 'ASO  ', 91, tags[:artist_sort], 90, '  =>  ', 92, new_aso, 90, '  in file: ', 94, e
+      new_tags[:artist_sort] = new_aso
+    end
+
+    if new_aaso != tags[:album_artist_sort]
+      ck 33, 'AASO ', 91, tags[:album_artist_sort], 90, '  =>  ', 92, new_aaso, 90, '  in file: ', 94, e
+      new_tags[:album_artist_sort] = new_aaso
+    end
+
+    mapped_a = map_artist(config, tags[:artist])
+    mapped_aa = map_artist(config, tags[:album_artist])
+
+    if tags[:artist] != mapped_a
+      ck 33, 'A    ', 91, tags[:artist], 90, '  =>  ', 92, mapped_a, 90, '  in file: ', 94, e
+      new_tags[:artist] = mapped_a
+    end
+
+    if tags[:album_artist] != mapped_aa
+      ck 33, 'AA   ', 91, tags[:album_artist], 90, '  =>  ', 92, mapped_aa, 90, '  in file: ', 94, e
+      new_tags[:album_artist] = mapped_aa
+    end
+  end
+
+  exit
+elsif ARGV[0] == 'cover_ext_fix'
+  all = Dir.glob('**/cover', base: config['library_path']).sort
+
+  all.each do |e|
+    full_path = File.join(config['library_path'], e)
+
+    if File.directory?(full_path)
+      cl 33, 'Skipping directory ', full_path
+      next
+    end
+
+    codec_name = ffprobe_stream_property(full_path, 'codec_name', 'v:0')
+    cover_ext = nil
+
+    case codec_name
+    when 'mjpeg'
+      cover_ext = '.jpg'
+    when 'png'
+      cover_ext = '.png'
+    else
+      cl 31, 'Could not determine correct extension for cover file: ', e
+      next
+    end
+
+    FileUtils.mv full_path, full_path + cover_ext
+    ck 92, cover_ext + '  ', 94, e
+  end
+
+  exit
+elsif ARGV[0] == 'rdb_update'
+  if ARGV.length != 2
+    err 'radish rdb_update requires 1 additional argument!'
+  end
+
+  db_data = File.read(ARGV[1])
+
+  #p̶̠̹͙̲̒͒a̴̩͍̎ṙ̴̥̠͇s̴̡͎͉̽͠i̷̋͌̄͜n̷̫͓̄̐̒͠g̷̢̭̣͈̏ ̴͚̈͠x̴̤̹̱̒̈́̑ͅm̸̻̂̈l̸̻͒͗ ̴͎̠̮̣͒͘w̵̟̻̄̈͘͝i̵̛̗͛͗̋t̸͓͐̓ḥ̴͝ͅ ̸̡̜̎r̵̤̫͌̂̆ȅ̶̩̗̘̙̏̾̋g̵̯̥͑ḝ̴̜͘͝͝x̸̞̮̟͆̓̀
+  files = db_data.scan(/file:\/\/(\/[^<]+)</)
+  parser = URI::Parser.new
+
+  keys = mapping.keys
+
+  files.each do |e, _|
+    fixed = parser.unescape(e.gsub('&amp;', '&'))
+
+    prefixes = keys.select { |e2| fixed.start_with?(e2) }
+
+    if prefixes.empty?
+      cl 33, 'Unmapped file: ', fixed
+      next
+    end
+    longest_mapped_prefix = prefixes.max_by(&:length)
+    mapped = fixed.sub(longest_mapped_prefix, mapping[longest_mapped_prefix])
+
+    #ck 91, fixed, 90, '  =>  ', 92, mapped
+
+    encoded_orig = parser.escape(fixed).gsub(';', '%3B').gsub('&', '&amp;').gsub('[', '%5B').gsub(']', '%5D')
+    if encoded_orig != e
+      puts e
+      puts encoded_orig
+      exit
+    end
+
+    encoded = parser.escape(mapped).gsub(';', '%3B').gsub('&', '&amp;').gsub('[', '%5B').gsub(']', '%5D')
+    db_data = db_data.gsub(e, encoded)
+  end
+
+  File.write('new_db_data.xml', db_data)
+
+  exit
 end
 
 fast_forward = false
@@ -644,13 +801,15 @@ ARGV.each do |source|
   is_dir, audio_files, source_dir, all_tags = read_source(source, aso)
 
   if audio_files.empty?
-    cl 31, 'No audio files found!'
-    print 'Press enter to continue. '.c(31)
-    query
+    cl 31, 'No audio files found! Skipping source.'
+    next
   end
 
   if config['run_beets']
-    input = pq 'Running beets; [n] to skip, [f] to enter CLI flags: '
+    input = pq 'Running beets; [n] to cancel, [s] to skip source entirely, [f] to enter CLI flags: '
+
+    next if input == 's'
+
     if input != 'n'
       beet_cmd = config['beet_command'].clone
       if input == 'f'
@@ -688,16 +847,7 @@ ARGV.each do |source|
   caa_thread = nil
   $cover_art_data ||= {}
 
-  if config['load_caa'] && !global_tags[:mb_release_id].nil?
-    caa_thread = Thread.new do
-      rel_id = global_tags[:mb_release_id]
-      begin
-        $cover_art_data[rel_id] = URI.open("https://coverartarchive.org/release/#{rel_id}/front")
-      rescue
-        $cover_art_data[rel_id] = :none
-      end
-    end
-  end
+  caa_thread = try_load_caa(global_tags) if config['load_caa']
 
   artists = all_tags.values.map { |e| e[:artist] }
   # puts 'All artists: '.c(35) + artists.uniq.sort.map { |e| e.c(95) }.join(', '.c(35))
@@ -894,11 +1044,12 @@ ARGV.each do |source|
         any_match = false
         all_tags.each do |file, tags|
           basename = File.basename(file)
-          match = basename.match(/\d+-(\d+)-.*\.flac/)
+          match = basename.match(/(\d+)-(\d+)-.*\.flac/)
           if match
             any_match = true
-            tags[:track] = match[1].to_i
-            cl 34, 'Found track number ', tags[:track], ' from filename ', file
+            tags[:track] = match[2].to_i
+            tags[:disc] = match[1].to_i + 1
+            cl 34, 'Found track number ', tags[:track], ' (disc ', tags[:disc], ') from filename ', file
           end
         end
         cl 33, 'Found no matching filenames...' unless any_match
@@ -907,6 +1058,7 @@ ARGV.each do |source|
       puts
     end
 
+    all_tracks = all_tags.map { |k, v| v[:track] } # Redo to catch potentially duplicate Booth-styles
     track_groups = all_tracks.compact.group_by { |e| e }.values.sort_by(&:first)
     if track_groups.any? { |e| e.length > 1 }
       puts 'Found duplicate track numbers! All track numbers: '.c(33) + track_groups.flatten.map { |e| e.to_s.c(93) }.join(', '.c(33))
@@ -961,8 +1113,20 @@ ARGV.each do |source|
         bnd.start_with?('cover') || bnd.start_with?('folder')
       end
 
+      if config['always_wait_for_caa'] && !caa_thread.nil? && caa_thread.alive? && !definitive_covers.any?
+        cl 34, 'Waiting for CAA retrieval to finish...'
+        caa_thread.join
+      end
+
+      caa_data = $cover_art_data[global_tags[:mb_release_id]]
+
       if definitive_covers.any?
         cover_source = File.join(source, definitive_covers.first)
+        cover_ext = File.extname(cover_source)
+      elsif !caa_data.nil? && caa_data != :none
+        cl 32, 'Using cover art from the CAA'
+        cover_source = config['cover_file']
+        File.write(cover_source, caa_data.read)
       else
         cl 90, 'Could not find definitive cover image. Image files found:'
 
@@ -971,9 +1135,6 @@ ARGV.each do |source|
           size = File.size(File.join(source, image_file))
           cl 90, ' [', i.to_s.rjust(l, ' '), "]: #{image_file} (#{size} bytes)"
         end
-
-        caa_data = $cover_art_data[global_tags[:mb_release_id]]
-        cl 32, 'CAA cover art appears to be available!' if !caa_data.nil? && caa_data != :none
 
         loop do
           command = pq 'Select one of the above, paste a path or URL ([c] to copy metadata), [m] to check the CAA, or press enter for no cover art: '
@@ -985,6 +1146,7 @@ ARGV.each do |source|
             cl 32, "Copied '", str, "' to clipboard!"
             next
           elsif command == 'm'
+            caa_thread = try_load_caa(global_tags) unless config['load_caa'] # if we haven't done this before, do it now
             caa_data = check_caa(global_tags[:mb_release_id], caa_thread)
             next if caa_data.nil?
             cover_source = config['cover_file']
@@ -1018,20 +1180,20 @@ ARGV.each do |source|
           end
           break
         end
+      end
 
-        unless cover_source.nil?
-          codec_name = ffprobe_stream_property(cover_source, 'codec_name', 'v:0')
-          case codec_name
-          when 'mjpeg'
-            cover_ext = '.jpg'
-          when 'png'
-            cover_ext = '.png'
-          else
-            cl 34, 'Converting ', codec_name, ' image to png.'
-            safe_run('ffmpeg', '-y', '-i', cover_source, config['cover_converted_file'])
-            cover_source = config['cover_converted_file']
-            cover_ext = '.png'
-          end
+      if !cover_source.nil? && cover_ext.nil?
+        codec_name = ffprobe_stream_property(cover_source, 'codec_name', 'v:0')
+        case codec_name
+        when 'mjpeg'
+          cover_ext = '.jpg'
+        when 'png'
+          cover_ext = '.png'
+        else
+          cl 34, 'Converting ', codec_name, ' image to png.'
+          safe_run('ffmpeg', '-y', '-i', cover_source, config['cover_converted_file'])
+          cover_source = config['cover_converted_file']
+          cover_ext = '.png'
         end
       end
     end
@@ -1089,7 +1251,6 @@ ARGV.each do |source|
     end
 
     unless cover_source.nil?
-      cover_ext = File.extname(cover_source) if cover_ext.nil?
       (all_tags.map { |k, v| File.dirname(k) } + ['.']).uniq.each do |tfwmf|
         new_cover_path = File.join(target_dir, tfwmf, 'cover' + cover_ext)
         unless File.exist?(new_cover_path)
