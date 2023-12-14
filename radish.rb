@@ -7,9 +7,6 @@ require 'uri'
 require 'open-uri'
 require 'cgi'
 
-# Defines cl, hr2, etc
-load '~/Projects/utils.rb'
-
 # radish should manage:
 # - album artist
 # - track numbers
@@ -20,7 +17,11 @@ load '~/Projects/utils.rb'
 #     [date/event] album artist - album [format]
 # - rhythmdb integration
 
-config = Tomlrb.load_file('/home/miras/Projects/radishes/radish.toml')
+config_file_path = File.join(File.expand_path(File.dirname(__FILE__)), 'radish.toml')
+config = Tomlrb.load_file(config_file_path)
+
+# Defines cl, hr2, etc
+load config['utils']
 
 def cont_range?(array)
   !array.include?(nil) && array.min == 1 && array.max == array.length && array.sort == 1.upto(array.length).to_a
