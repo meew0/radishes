@@ -6,6 +6,7 @@ require 'json'
 require 'uri'
 require 'open-uri'
 require 'cgi'
+require 'unicode/display_width'
 
 # radish should manage:
 # - album artist
@@ -141,6 +142,7 @@ end
 
 def read_tags_from_xiph(tag)
   tags = {}
+  tags[:title] = tag.title
   tags[:album] = tag.album
   tags[:artist] = tag.artist
   fields = hash_downcase(tag.field_list_map)
@@ -179,6 +181,7 @@ def read_tags(filename, codec_name)
     TagLib::MPEG::File.open(filename) do |file|
       if file.id3v2_tag?
         tag = file.id3v2_tag
+        tags[:title] = tag.title
         tags[:album] = tag.album
         tags[:artist] = tag.artist
         tags[:release_date] = tag.frame_list('TDRC')&.first&.to_s || (tag.year == 0 ? nil : tag.year.to_s)
@@ -199,6 +202,7 @@ def read_tags(filename, codec_name)
   when 'aac'
     TagLib::MP4::File.open(filename) do |file|
       tag = file.tag
+      tags[:title] = tag.title
       tags[:album] = tag.album
       tags[:artist] = tag.artist
       ilm = tag.item_map
@@ -232,6 +236,8 @@ end
 def write_tags_to_xiph(tag, tags)
   iterate_tags(tags) do |k, v|
     case k
+    when :title
+      tag.title = v
     when :album
       tag.album = v
     when :artist
@@ -294,6 +300,8 @@ def write_tags(filename, codec_name, tags)
       tag = file.id3v2_tag
       iterate_tags(tags) do |k, v|
         case k
+        when :title
+          tag.title = v
         when :album
           tag.album = v
         when :artist
@@ -330,6 +338,8 @@ def write_tags(filename, codec_name, tags)
       ilm = tag.item_map
       iterate_tags(tags) do |k, v|
         case k
+        when :title
+          tag.title = v
         when :album
           tag.album = v
         when :artist
@@ -367,6 +377,143 @@ def write_tags(filename, codec_name, tags)
       file.save
     end
   end
+end
+
+PRINTED_TAGS = [
+  [:id, "~"],
+  [:disc, "D#"],
+  [:track, "T#"],
+  [:title, "Title"],
+  [:artist, "Artist"],
+]
+
+PRINTED_TAG_COLOURS = {
+  id: 33,
+  disc: 35,
+  track: 36,
+  title: 37,
+  artist: 94,
+}
+
+PRINTED_TAG_RIGHT = {
+  id: true,
+  disc: true,
+  track: true,
+  title: false,
+  artist: false,
+}
+
+def table_cell(content, column_width, colour, right)
+  content = (content || '').to_s
+  display_width = Unicode::DisplayWidth.of(content)
+  width_diff = column_width - display_width
+  if width_diff >= 0
+    spaces = ' ' * width_diff
+    content = right ? (spaces + content) : (content + spaces)
+  else
+    # We have to truncate the string
+    content = content[0...column_width]
+    if column_width > 3
+      # We can insert an ellipsis
+      content[-3..-1] = '...'
+    end
+  end
+
+  content.c(colour)
+end
+
+def sort_tags(all_tags)
+  sorted = all_tags.sort_by { |k, v| v[:track] || 0 }.sort_by { |k, v| v[:disc] || 0 }
+  sorted.each_with_index { |e, i| e[1][:id] = (i + 1) }
+  [Hash[sorted], Hash[sorted.map { |k, v| [v[:id], k] }]]
+end
+
+def print_tags(all_tags)
+  sorted = all_tags.sort_by { |k, v| v[:id] }
+  printed_tags_lookup = Hash[PRINTED_TAGS]
+  col_width_array = printed_tags_lookup.keys.map do |tag_key|
+    widths = all_tags.map do |k, v|
+      content = v[tag_key] || ''
+      content = k if tag_key == :title && content.empty?
+      Unicode::DisplayWidth.of(content.to_s)
+    end
+    widths << Unicode::DisplayWidth.of(printed_tags_lookup[tag_key])
+    [tag_key, widths.max]
+  end
+  col_widths = Hash[col_width_array]
+  puts PRINTED_TAGS.map { |key, header| table_cell(header, col_widths[key], 36, false) }.join(' ')
+
+  sorted.each do |k, v|
+    cells = PRINTED_TAGS.map do |key, _|
+      if key == :title && (!v.key?(key) || v[key].empty?)
+        table_cell(k, col_widths[key], 90, PRINTED_TAG_RIGHT[key])
+      else
+        table_cell(v[key], col_widths[key], PRINTED_TAG_COLOURS[key], PRINTED_TAG_RIGHT[key])
+      end
+    end
+    puts cells.join(' ')
+  end
+end
+
+def edit_tags_query
+  print 'Select fields to edit ('.c(33) + ['d', '#', 't', 'a'].map { |e| e.c(93) }.join('/'.c(33)) + ' 1,3-5'.c(93) + ') or '.c(33) + 'q'.c(93) + ' to quit editing: '.c(33)
+  input = query
+  selector, *values = input.split('=')
+  return nil if selector.nil? # empty
+
+  v = values.join('=')
+  field = nil
+  if selector =~ /d/
+    field = :disc
+  elsif selector =~ /#/
+    field = :track
+  elsif selector =~ /t/
+    field = :title
+  elsif selector =~ /a/
+    field = :artist
+  elsif selector =~ /q/
+    return nil
+  end
+
+  a = selector[/[\d,\-]+/]
+  processed = a.split(',').map do |e|
+    split = e.split('-')
+    if split.length == 1
+      [split[0].to_i]
+    elsif split.length == 2
+      [*((split[0].to_i)..(split[1].to_i))]
+    else
+      cl 31, 'Invalid input: ', e
+      []
+    end
+  end
+
+  [field, processed.flatten, v]
+end
+
+def edit_tags(all_tags, pmap)
+  field, indices, value = nil, nil, nil
+  loop do
+    res = edit_tags_query
+    return false if res.nil?
+    field, indices, value = res
+    if field.nil?
+      cl 31, 'Invalid field specified'
+    else
+      break
+    end
+  end
+  if value.nil?
+    print 'Enter value: '.c(33)
+    value = query
+  end
+  value = value.to_i if [:disc, :track].include? field
+  indices.each do |i|
+    all_tags[pmap[i]][field] = value
+  end
+
+  cl 32, 'Set ', field, ' of files #[', indices.join(', '), '] to value ', value
+  true
 end
 
 class ASOSkip < Exception; end
@@ -853,8 +1000,17 @@ ARGV.each do |source|
   artists = all_tags.values.map { |e| e[:artist] }
   # puts 'All artists: '.c(35) + artists.uniq.sort.map { |e| e.c(95) }.join(', '.c(35))
 
+  # --- Interactive tag editor ---
+  all_tags, pmap = sort_tags all_tags
+  print_tags all_tags
+
   ck 90, 'Enter [', 37, '-', 90, '] to leave a field empty.'
-  fstr = pq "Audio format [%%]: ", format_str(codec_name, bit_rate, bit_depth, sample_rate)
+  fstr = nil
+  while (fstr = pq "Audio format [%%], or [e] to edit tags: ", format_str(codec_name, bit_rate, bit_depth, sample_rate)) == 'e'
+    while edit_tags(all_tags, pmap)
+      print_tags all_tags
+    end
+  end
 
   album = pq "Album [%%]: ", global_tags[:album]
   album_artist = pq "Album artist [%%]; [v] for various: ", map_artist(config, global_tags[:album_artist])
@@ -1221,12 +1377,8 @@ ARGV.each do |source|
       path = File.join(target_dir, file)
       new_tags = tags.clone
 
-      if config['artist_remap'].key?(tags[:artist])
-        new_tags[:artist] = config['artist_remap'][tags[:artist]]
-      else
-        new_tags.delete(:artist)
-      end
-
+      new_tags[:artist] = config['artist_remap'][tags[:artist]] if config['artist_remap'].key?(tags[:artist])
+      
       new_tags[:album] = unify_target if unify_albums
       new_tags[:album_artist] = album_artist
       new_tags[:album_artist_sort] = album_artist_sort
