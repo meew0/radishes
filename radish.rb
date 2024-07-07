@@ -1134,8 +1134,17 @@ ARGV.each do |source|
     loop do
       target, target_display = finalise_target(target_components)
 
-      puts 'Target: '.c(90) + target_display
-      puts '        ' + target.c(90)
+      target_note = 'Target: '
+      target_spacer = ' ' * target_note.length
+      puts target_note.c(90) + target_display
+      puts target_spacer + target.c(90)
+
+      target_components_reduced = target_components.clone
+      target_components_reduced.delete(:new_folder_name)
+      target_components_reduced.delete(:basename)
+      target_aa_folder = finalise_target(target_components_reduced).first
+
+      puts target_spacer + target_aa_folder.c(91) + ' does not yet exist!'.c(31) unless File.directory?(target_aa_folder)
 
       cl 33, '(Target already exists! Consider deleting it before proceeding; otherwise there might be problems)' if File.exist?(target)
       cl 33, "Album artist folder is '", config['various_artists'], "'; consider setting a different one." if target_components[:aa_path] == config['various_artists']
@@ -1378,7 +1387,7 @@ ARGV.each do |source|
       new_tags = tags.clone
 
       new_tags[:artist] = config['artist_remap'][tags[:artist]] if config['artist_remap'].key?(tags[:artist])
-      
+
       new_tags[:album] = unify_target if unify_albums
       new_tags[:album_artist] = album_artist
       new_tags[:album_artist_sort] = album_artist_sort
