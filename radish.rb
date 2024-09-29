@@ -968,6 +968,8 @@ ARGV.each do |source|
       # When importing only one file
       beet_cmd << '-s' unless is_dir
 
+      beet_cmd << '-t' # always timid
+
       beet_cmd << source
       hr 80
       cl 90, (['$'] + beet_cmd).join(' ')
