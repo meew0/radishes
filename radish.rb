@@ -701,7 +701,7 @@ def read_source(source, aso)
   end
   all_tags = Hash[all_tags]
 
-  aso.ingest(all_tags.values)
+  aso.ingest(all_tags.values) unless aso.nil?
   [is_dir, audio_files, source_dir, all_tags]
 end
 
@@ -946,7 +946,7 @@ ARGV.each do |source|
 
   cl 34, 'Processing: ', source
 
-  is_dir, audio_files, source_dir, all_tags = read_source(source, aso)
+  is_dir, audio_files, source_dir, all_tags = read_source(source, nil)
 
   if audio_files.empty?
     cl 31, 'No audio files found! Skipping source.'
