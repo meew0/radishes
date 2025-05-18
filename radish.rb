@@ -954,7 +954,7 @@ ARGV.each do |source|
   end
 
   if config['run_beets']
-    input = pq 'Running beets; [n] to cancel, [s] to skip source entirely, [f] to enter CLI flags: '
+    input = pq 'Running beets; [n] to cancel, [s] to skip source entirely, [f] to enter CLI flags, [l] to skip search, or enter ID: '
 
     next if input == 's'
 
@@ -969,6 +969,12 @@ ARGV.each do |source|
       beet_cmd << '-s' unless is_dir
 
       beet_cmd << '-t' # always timid
+
+      beet_cmd += ['--search-id', 'a'] if input == 'l'
+
+      if input&.match?(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)
+        beet_cmd += ['--search-id', input]
+      end
 
       beet_cmd << source
       hr 80
