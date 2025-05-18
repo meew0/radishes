@@ -7,6 +7,7 @@ require 'uri'
 require 'open-uri'
 require 'cgi'
 require 'unicode/display_width'
+require 'open3'
 
 # radish should manage:
 # - album artist
@@ -151,6 +152,7 @@ def read_tags_from_xiph(tag)
   tags[:artist_sort] = fields['artistsort']&.first
   tags[:album_sort] = fields['albumsort']&.first
   tags[:album_artist_sort] = fields['albumartistsort']&.first
+  tags[:title_sort] = fields['titlesort']&.first
   tags[:track] = fields['tracknumber']&.first&.to_i || fields['track']&.first&.to_i
   tags[:total_tracks] = fields['totaltracks']&.first&.to_i || fields['tracktotal']&.first&.to_i || fields['trackc']&.first&.to_i
   tags[:disc] = fields['discnumber']&.first&.to_i || fields['disc']&.first&.to_i
@@ -189,6 +191,7 @@ def read_tags(filename, codec_name)
         tags[:artist_sort] = tag.frame_list('TSOP')&.first&.to_s
         tags[:album_sort] = tag.frame_list('TSOA')&.first&.to_s
         tags[:album_artist_sort] = mp3_user_value(tag, 'ALBUMARTISTSORT')
+        tags[:title_sort] = tag.frame_list('TSOT')&.first&.to_s
         tags[:disambiguation] = mp3_user_value(tag, 'MusicBrainz Album Comment')
         tags[:mb_release_id] = mp3_user_value(tag, 'MusicBrainz Album Id')
         tags[:track], tags[:total_tracks] = mp3_unpack(tag.frame_list('TRCK')&.first&.to_s)
@@ -211,6 +214,7 @@ def read_tags(filename, codec_name)
       tags[:artist_sort] = ilm['soar']&.to_string_list&.first
       tags[:album_sort] = ilm['soal']&.to_string_list&.first
       tags[:album_artist_sort] = ilm['soaa']&.to_string_list&.first
+      tags[:title_sort] = ilm['sonm']&.to_string_list&.first
       tags[:track] = ilm['trkn']&.to_int_pair&.first
       tags[:disc] = ilm['disc']&.to_int_pair&.first
     end
@@ -257,6 +261,8 @@ def write_tags_to_xiph(tag, tags)
       tag.add_field 'ALBUMSORT', v
     when :album_artist_sort
       tag.add_field 'ALBUMARTISTSORT', v
+    when :title_sort
+      tag.add_field 'TITLESORT', v
     when :track
       tag.add_field 'TRACK', v.to_s
       tag.add_field 'TRACKNUMBER', v.to_s
@@ -323,6 +329,8 @@ def write_tags(filename, codec_name, tags)
           tag.remove_frame(frame) unless frame.nil?
           new_frame = TagLib::ID3v2::UserTextIdentificationFrame.new(ALBUMARTISTSORT, [v.to_s], TagLib::String::UTF8)
           tag.add_frame(new_frame)
+        when :title_sort
+          mp3_t_frame(tag, 'TSOT', v)
         when :track
           mp3_t_frame(tag, 'TRCK', "#{v}/#{tags[:total_tracks]}")
         when :disc
@@ -357,6 +365,8 @@ def write_tags(filename, codec_name, tags)
           ilm.insert 'soal', TagLib::MP4::Item.from_string_list([v.to_s])
         when :album_artist_sort
           ilm.insert 'soaa', TagLib::MP4::Item.from_string_list([v.to_s])
+        when :title_sort
+          ilm.insert 'sonm', TagLib::MP4::Item.from_string_list([v.to_s])
         when :track
           ilm.insert 'trkn', TagLib::MP4::Item.from_int_pair([v, tags[:total_tracks]])
         when :disc
@@ -384,6 +394,7 @@ PRINTED_TAGS = [
   [:disc, "D#"],
   [:track, "T#"],
   [:title, "Title"],
+  [:title_sort, "Title sort"],
   [:artist, "Artist"],
 ]
 
@@ -392,6 +403,7 @@ PRINTED_TAG_COLOURS = {
   disc: 35,
   track: 36,
   title: 37,
+  title_sort: 90,
   artist: 94,
 }
 
@@ -400,6 +412,7 @@ PRINTED_TAG_RIGHT = {
   disc: true,
   track: true,
   title: false,
+  title_sort: false,
   artist: false,
 }
 
@@ -456,7 +469,7 @@ def print_tags(all_tags)
 end
 
 def edit_tags_query
-  print 'Select fields to edit ('.c(33) + ['d', '#', 't', 'a'].map { |e| e.c(93) }.join('/'.c(33)) + ' 1,3-5'.c(93) + ') or '.c(33) + 'q'.c(93) + ' to quit editing: '.c(33)
+  print 'Select fields to edit ('.c(33) + ['d', '#', 't', 'a', 's'].map { |e| e.c(93) }.join('/'.c(33)) + ' 1,3-5'.c(93) + ') or '.c(33) + 'q'.c(93) + ' to quit editing: '.c(33)
   input = query
   selector, *values = input.split('=')
   return nil if selector.nil? # empty
@@ -471,6 +484,8 @@ def edit_tags_query
     field = :title
   elsif selector =~ /a/
     field = :artist
+  elsif selector =~ /s/
+    field = :title_sort
   elsif selector =~ /q/
     return nil
   end
@@ -516,10 +531,11 @@ def edit_tags(all_tags, pmap)
   true
 end
 
-class ASOSkip < Exception; end
+def query_stdin
+  STDIN.gets.chomp
+end
 
-# ASO / artist sort order file
-class ASO
+class SortOrderFile
   def initialize(path)
     @path = path
     load
@@ -533,6 +549,15 @@ class ASO
     File.write(@path, JSON.pretty_generate(@aso))
   end
 
+  def data
+    @aso
+  end
+end
+
+class ASOSkip < Exception; end
+
+# ASO / artist sort order file
+class ASO < SortOrderFile
   def ingest(tags_set)
     begin
       tags_set.each do |tags|
@@ -606,10 +631,6 @@ class ASO
     result = query_stdin
     raise ASOSkip if result == 's'
     result.empty? ? artist : result
-  end
-
-  def query_stdin
-    STDIN.gets.chomp
   end
 end
 
@@ -991,6 +1012,48 @@ ARGV.each do |source|
 
   cl 32, 'Found ', *cl_s(audio_files.length, ' audio file')
 
+  # Title sorting
+  hr 80
+  tso = SortOrderFile.new(config['tso_file'])
+  cl 34, 'Enter sort titles, [', 's', '] to skip, or [', 'r', '] to reuse last sort titles.'
+  tso_reuse = false
+  all_tags.each do |file, tags|
+    track_id = (tags[:disc].nil? ? "#{tags[:disc]}-" : '') + tags[:track].to_s + ' '
+
+    title_sort, title_sort_color = nil, 37
+    title_sort, title_sort_color = tags[:title_sort], 91 unless tags[:title_sort].nil?
+    title_sort, title_sort_color = tso.data[tags[:title]], 93 unless tso.data[tags[:title]].nil?
+
+    tso_reuse = false if title_sort.nil?
+
+    tso_ck = [90, track_id, 37, tags[:title], 90, ' [', title_sort_color, title_sort, 90, ']: ']
+
+    if tso_reuse
+      ck *tso_ck
+    else
+      ckn *tso_ck
+      command = query_stdin
+
+      break if command == 's'
+
+      if command.empty?
+        title_sort = tags[:title] if title_sort.nil?
+      elsif command == '-'
+        title_sort = nil
+      elsif command == 'r'
+        tso_reuse = true
+      else
+        title_sort = command
+      end
+    end
+
+    tags[:title_sort] = title_sort
+    tso.data[tags[:title]] = title_sort unless title_sort.nil? || tso_reuse
+    tso.save
+  end
+  hr 80
+
+  # Determine bit depth and sample rate
   test_file = File.join(source_dir, audio_files[0])
 
   bit_depth = ffprobe_stream_property(test_file, 'bits_per_raw_sample')
@@ -1000,6 +1063,7 @@ ARGV.each do |source|
 
   global_tags = all_tags[audio_files[0]]
 
+  # Start cover art retrieval
   caa_thread = nil
   $cover_art_data ||= {}
 
@@ -1278,6 +1342,27 @@ ARGV.each do |source|
       album_sort = pq 'Enter album sort order [%%]: ', global_tags[:album_sort] || album
       puts
     end
+
+    # ReplayGain
+    hr 80
+    if config['run_rsgain']
+      rsgain_command = config['rsgain_command'].clone
+      rsgain_command += audio_files.map { |filename| File.join(source_dir, filename) }
+
+      Open3.popen3({ 'LD_LIBRARY_PATH' => '/usr/lib' }, *rsgain_command) do |stdin, stdout, stderr, wait_thr|
+        stdin.close
+        Thread.new { stdout.each { |l| STDOUT.print l; STDOUT.flush } }
+        Thread.new { stderr.each { |l| STDERR.print l; STDERR.flush } }
+        exit_status = wait_thr.value
+        unless exit_status.success?
+          cln 31, 'rsgain failed! Continue? '
+          query_stdin
+        end
+      end
+    else
+      cl 33, 'Not running rsgain (disabled in config)'
+    end
+    hr 80
 
     cover_source, cover_ext = nil, nil
     if is_dir
