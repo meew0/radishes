@@ -18,8 +18,8 @@ require 'json'
 require 'erb'
 require 'thread'
 
-set :bind, '0.0.0.0'
-set :port, (ENV['PORT'] || 4567)
+set :bind, '127.0.0.1'
+set :port, (ENV['PORT'] || 53992)
 set :static, false
 
 # ----------------------------------------------------------------------------
