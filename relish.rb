@@ -212,7 +212,7 @@ __END__
   const inputs = Array.from(document.querySelectorAll('input.sort-order'));
 
   const saveSingle = (inp) => {
-    fetch('/update', {
+    fetch('update', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: inp.dataset.id, sort_order: inp.value })
@@ -242,7 +242,7 @@ __END__
 
   const bulkSave = () => {
     const items = inputs.map(inp => ({ id: inp.dataset.id, sort_order: inp.value.trim() === '' ? inp.dataset.title : inp.value }));
-    return fetch('/batch', {
+    return fetch('batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ items })
